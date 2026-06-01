@@ -358,8 +358,8 @@ def collect_city(city):
         body = body_raw.strip()
 
         # Keep long enough for testing and import, but avoid huge pages.
-        if len(body) > 5000:
-            body = body[:5000].rsplit(" ", 1)[0] + "..."
+        if len(body) > 10000:
+            body = body[:10000].rsplit(" ", 1)[0] + "..."
 
         body += f"\n\nForrás: {cand['url']}"
 
