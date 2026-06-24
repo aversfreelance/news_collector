@@ -1,7 +1,8 @@
+# Pest county news collector. After edits, run: npm run sync-collector-script
 import json, re, unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote
 import requests
 from bs4 import BeautifulSoup
 from difflib import SequenceMatcher
@@ -14,6 +15,12 @@ MAX_PER_CITY = 5
 HEADERS = {
     "User-Agent": "Mozilla/5.0 PestMegyeiHirlapBot/1.0 (+https://pestmegyeihirlap.hu)"
 }
+
+BINARY_EXTENSIONS = (
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".zip", ".rar", ".7z", ".odt", ".ods", ".odp", ".rtf", ".csv",
+    ".bin", ".exe", ".dmg",
+)
 
 BAD_IMAGE_WORDS = [
     "logo", "favicon", "sprite", "placeholder", "avatar", "icon",
@@ -47,7 +54,11 @@ BAD_TITLE_WORDS = [
     "üvegzseb",
     "letölthető",
     "nyomtatvány",
-    "fogadóóra"
+    "fogadóóra",
+    "dokumentum",
+    "melléklet",
+    "sablon",
+    "formanyomtatvány",
 ]
 
 BAD_URL_WORDS = [
@@ -75,7 +86,12 @@ BAD_URL_WORDS = [
     "login",
     "search",
     "kereses",
-    "sitemap"
+    "sitemap",
+    "dokumentum",
+    "melleklet",
+    "attachment",
+    "download",
+    "forcedownload",
 ]
 
 GOOD_URL_WORDS = [
@@ -86,7 +102,7 @@ GOOD_URL_WORDS = [
     "cikk",
     "news",
     "bejegyzes",
-    "post"
+    "post",
 ]
 
 
@@ -105,14 +121,39 @@ def fetch(url):
     try:
         r = requests.get(url, headers=HEADERS, timeout=25)
         r.raise_for_status()
+        content_type = (r.headers.get("content-type") or "").lower()
+        if "text/html" not in content_type and "application/xhtml" not in content_type:
+            print(f"SKIP non-html {url}: {content_type}")
+            return ""
         return r.text
     except Exception as e:
         print(f"FETCH ERROR {url}: {e}")
         return ""
 
 
+def is_binary_url(url):
+    if not url:
+        return False
+
+    path = unquote(urlparse(url).path.lower())
+    if any(path.endswith(ext) for ext in BINARY_EXTENSIONS):
+        return True
+    if any(ext + "?" in url.lower() for ext in BINARY_EXTENSIONS):
+        return True
+
+    low = url.lower()
+    if any(marker in low for marker in ["/letoltes/", "/download/", "forcedownload=", "attachment_id="]):
+        if any(ext in path for ext in BINARY_EXTENSIONS):
+            return True
+
+    return False
+
+
 def is_probably_image(url):
     if not url or not url.startswith("http"):
+        return False
+
+    if is_binary_url(url):
         return False
 
     low = url.lower()
@@ -120,10 +161,9 @@ def is_probably_image(url):
     if any(w in low for w in BAD_IMAGE_WORDS):
         return False
 
-    if any(ext in low for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+    if any(ext in low for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]):
         return True
 
-    # Some CMS image handlers serve images without an extension.
     if any(marker in low for marker in ["/image/", "image=", "kep=", "picture=", "photo=", "media/"]):
         return True
 
@@ -139,11 +179,103 @@ def clean_img_url(src, base):
     if src.startswith("data:"):
         return ""
 
-    # srcset: pick the first usable URL
     if "," in src and " " in src:
         src = src.split(",")[0].strip().split(" ")[0]
 
     return urljoin(base, src)
+
+
+def parse_date_string(raw):
+    if not raw:
+        return None
+
+    raw = str(raw).strip()
+    if not raw:
+        return None
+
+    iso = re.match(r"^(\d{4})-(\d{2})-(\d{2})", raw)
+    if iso:
+        return f"{iso.group(1)}-{iso.group(2)}-{iso.group(3)}"
+
+    dotted = re.search(r"(\d{4})\D+(\d{1,2})\D+(\d{1,2})", raw)
+    if dotted:
+        y, m, d = int(dotted.group(1)), int(dotted.group(2)), int(dotted.group(3))
+        if 1990 <= y <= 2100 and 1 <= m <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{m:02d}-{d:02d}"
+
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return parsed.date().isoformat()
+    except ValueError:
+        pass
+
+    return None
+
+
+def extract_json_ld_dates(data):
+    if isinstance(data, dict):
+        for key in ("datePublished", "uploadDate", "dateCreated"):
+            d = parse_date_string(data.get(key))
+            if d:
+                return d
+        graph = data.get("@graph")
+        if isinstance(graph, list):
+            for item in graph:
+                d = extract_json_ld_dates(item)
+                if d:
+                    return d
+    elif isinstance(data, list):
+        for item in data:
+            d = extract_json_ld_dates(item)
+            if d:
+                return d
+    return None
+
+
+def extract_published_date(soup):
+    meta_specs = [
+        ("meta", {"property": "article:published_time"}, "content"),
+        ("meta", {"property": "og:article:published_time"}, "content"),
+        ("meta", {"name": "pubdate"}, "content"),
+        ("meta", {"name": "publish-date"}, "content"),
+        ("meta", {"name": "date"}, "content"),
+        ("meta", {"itemprop": "datePublished"}, "content"),
+        ("meta", {"property": "article:modified_time"}, "content"),
+    ]
+
+    for tag, attrs, attr in meta_specs:
+        el = soup.find(tag, attrs=attrs)
+        if el:
+            d = parse_date_string(el.get(attr))
+            if d:
+                return d
+
+    for time_el in soup.find_all("time"):
+        for attr in ("datetime", "content"):
+            d = parse_date_string(time_el.get(attr))
+            if d:
+                return d
+        d = parse_date_string(time_el.get_text(" ", strip=True))
+        if d:
+            return d
+
+    for css in [".date", ".post-date", ".published", ".entry-date", ".news-date", "time"]:
+        el = soup.select_one(css)
+        if el:
+            d = parse_date_string(el.get("datetime") or el.get_text(" ", strip=True))
+            if d:
+                return d
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            payload = json.loads(script.string or script.get_text() or "")
+            d = extract_json_ld_dates(payload)
+            if d:
+                return d
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    return None
 
 
 def extract_image(soup, page_url):
@@ -234,18 +366,19 @@ def extract_text(soup):
             "megosztás",
             "tovább olvasom",
             "kapcsolódó cikk",
-            "vissza a hírekhez"
+            "vissza a hírekhez",
+            "letöltés",
+            "pdf formátumban",
+            "dokumentum letöltése",
         ]):
             continue
 
         paras.append(txt)
 
-    # Keep substantially more text than before.
     return "\n\n".join(paras[:30])
 
 
 def rewrite_light(text, max_len=900):
-    # Nem AI-átírás; biztonságos tesztimporthoz rövid, forráshű összefoglaló.
     text = re.sub(r"\s+", " ", text or "").strip()
 
     if len(text) <= max_len:
@@ -260,6 +393,9 @@ def is_probably_news(title, url, body):
     body_l = (body or "").lower().strip()
 
     if not title_l or not url_l:
+        return False
+
+    if is_binary_url(url):
         return False
 
     if len(title_l) < 15:
@@ -277,7 +413,6 @@ def is_probably_news(title, url, body):
     if any(bad in url_l for bad in BAD_URL_WORDS):
         return False
 
-    # Very menu-like titles are usually not articles.
     if len(title_l.split()) <= 2 and not any(good in url_l for good in GOOD_URL_WORDS):
         return False
 
@@ -291,6 +426,9 @@ def looks_like_news_link(title, href, city):
     if len(title_l) < 12:
         return False
 
+    if is_binary_url(href):
+        return False
+
     if any(x in href_l for x in ["#", "mailto:", "tel:", "facebook.com", "javascript:"]):
         return False
 
@@ -300,8 +438,6 @@ def looks_like_news_link(title, href, city):
     if any(bad in href_l for bad in BAD_URL_WORDS):
         return False
 
-    # Prefer URLs that look like news articles, but do not require it,
-    # because many Hungarian municipal websites use custom routing.
     return True
 
 
@@ -328,7 +464,6 @@ def find_candidate_links(city):
         if clean_href not in [x["url"] for x in links]:
             links.append({"title": title, "url": clean_href})
 
-    # Keep more candidates because filtering is stricter later.
     return links[:60]
 
 
@@ -351,13 +486,17 @@ def collect_city(city):
         if not is_probably_news(title, cand["url"], body_raw):
             continue
 
+        published = extract_published_date(soup)
+        if not published:
+            print(f"  SKIP no published date: {cand['url']}")
+            continue
+
         image = extract_image(soup, cand["url"])
 
         excerpt = rewrite_light(body_raw, 350)
 
         body = body_raw.strip()
 
-        # Keep long enough for testing and import, but avoid huge pages.
         if len(body) > 10000:
             body = body[:10000].rsplit(" ", 1)[0] + "..."
 
@@ -371,7 +510,7 @@ def collect_city(city):
             "body": body,
             "author": "Pest Megyei Hírlap",
             "url": cand["url"],
-            "date": datetime.now(timezone.utc).date().isoformat(),
+            "date": published,
             "image": image if is_probably_image(image) else "",
             "slug": slugify(f"{city['city']} {title}")
         })
@@ -400,6 +539,9 @@ def dedupe(items):
         title_city_key = f"{norm(city)}|{tnorm}"
 
         if not tnorm or not url:
+            continue
+
+        if is_binary_url(url):
             continue
 
         if url in seen_urls:
