@@ -1,6 +1,6 @@
 # Pest county news collector. After edits, run: npm run sync-collector-script
 import json, re, unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, unquote
 import requests
@@ -12,6 +12,7 @@ CONFIG = ROOT / "config" / "city_sources.json"
 DRAFT = ROOT / "public" / "import" / "pest-megye-news-draft.json"
 
 MAX_PER_CITY = 5
+MAX_ARTICLE_AGE_DAYS = 31
 HEADERS = {
     "User-Agent": "Mozilla/5.0 PestMegyeiHirlapBot/1.0 (+https://pestmegyeihirlap.hu)"
 }
@@ -103,6 +104,46 @@ GOOD_URL_WORDS = [
     "news",
     "bejegyzes",
     "post",
+]
+
+HU_MONTHS = {
+    "januar": 1,
+    "februar": 2,
+    "marcius": 3,
+    "aprilis": 4,
+    "majus": 5,
+    "junius": 6,
+    "julius": 7,
+    "augusztus": 8,
+    "szeptember": 9,
+    "oktober": 10,
+    "november": 11,
+    "december": 12,
+}
+
+SKIP_HOST_PARTS = [
+    "ugyfelablak",
+    "eugy.",
+    "portal.",
+    "tarhely.",
+]
+
+DATE_CSS = [
+    ".date",
+    ".datum",
+    ".dátum",
+    ".post-date",
+    ".published",
+    ".entry-date",
+    ".news-date",
+    ".article-date",
+    ".meta-date",
+    ".pub-date",
+    ".created",
+    ".time",
+    "[class*='date']",
+    "[class*='datum']",
+    "[class*='publish']",
 ]
 
 
@@ -203,6 +244,10 @@ def parse_date_string(raw):
         if 1990 <= y <= 2100 and 1 <= m <= 12 and 1 <= d <= 31:
             return f"{y:04d}-{m:02d}-{d:02d}"
 
+    hungarian = parse_hungarian_text_date(raw)
+    if hungarian:
+        return hungarian
+
     try:
         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         return parsed.date().isoformat()
@@ -210,6 +255,109 @@ def parse_date_string(raw):
         pass
 
     return None
+
+
+def parse_hungarian_text_date(raw):
+    text = norm(raw)
+    if not text:
+        return None
+
+    dotted = re.search(r"(\d{4})\D+(\d{1,2})\D+(\d{1,2})", text)
+    if dotted:
+        y, m, d = int(dotted.group(1)), int(dotted.group(2)), int(dotted.group(3))
+        if 1990 <= y <= 2100 and 1 <= m <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{m:02d}-{d:02d}"
+
+    for month_name, month_num in HU_MONTHS.items():
+        m = re.search(rf"(\d{{4}})\D*{month_name}\D*(\d{{1,2}})", text)
+        if m:
+            y, d = int(m.group(1)), int(m.group(2))
+            if 1990 <= y <= 2100 and 1 <= d <= 31:
+                return f"{y:04d}-{month_num:02d}-{d:02d}"
+
+    return None
+
+
+def extract_date_from_url(url):
+    path = unquote(urlparse(url).path)
+    patterns = [
+        r"/(\d{4})/(\d{1,2})/(\d{1,2})(?:/|$)",
+        r"/(\d{4})-(\d{1,2})-(\d{1,2})(?:/|$)",
+        r"/(\d{4})\.(\d{1,2})\.(\d{1,2})(?:/|$)",
+        r"/(\d{4})(\d{2})(\d{2})(?:/|$)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, path)
+        if not m:
+            continue
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1990 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    return None
+
+
+def extract_date_from_link_context(a_tag):
+    chunks = [a_tag.get_text(" ", strip=True)]
+    parent = a_tag.parent
+    if parent:
+        chunks.append(parent.get_text(" ", strip=True))
+    prev = a_tag.find_previous(["time", "span", "small", "div"])
+    if prev:
+        chunks.append(prev.get_text(" ", strip=True))
+
+    for chunk in chunks:
+        for d in (parse_date_string(chunk), parse_hungarian_text_date(chunk)):
+            if d:
+                return d
+    return None
+
+
+def extract_dates_from_visible_header(soup):
+    h1 = soup.find("h1")
+    if not h1:
+        return None
+
+    snippets = [h1.get_text(" ", strip=True)]
+    parent = h1.find_parent(["article", "main", "section", "div"])
+    if parent:
+        snippets.append(parent.get_text(" ", strip=True)[:700])
+
+    for snippet in snippets:
+        for d in (parse_date_string(snippet), parse_hungarian_text_date(snippet)):
+            if d:
+                return d
+    return None
+
+
+def find_first_page_date(soup):
+    main = soup.find("article") or soup.find("main") or soup.body
+    if not main:
+        return None
+
+    text = main.get_text(" ", strip=True)[:3500]
+    candidates = []
+    for m in re.finditer(r"\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}", text):
+        d = parse_date_string(m.group(0))
+        if d:
+            candidates.append(d)
+
+    for month_name in HU_MONTHS:
+        for m in re.finditer(rf"\d{{4}}\D*{month_name}\D*\d{{1,2}}", norm(text)):
+            d = parse_hungarian_text_date(m.group(0))
+            if d:
+                candidates.append(d)
+
+    return candidates[0] if candidates else None
+
+
+def is_recent_enough(date_iso):
+    try:
+        published = datetime.strptime(date_iso, "%Y-%m-%d").date()
+    except ValueError:
+        return False
+
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=MAX_ARTICLE_AGE_DAYS)
+    return published >= cutoff
 
 
 def extract_json_ld_dates(data):
@@ -232,7 +380,10 @@ def extract_json_ld_dates(data):
     return None
 
 
-def extract_published_date(soup):
+def extract_published_date(soup, page_url="", list_date=None):
+    if list_date:
+        return list_date
+
     meta_specs = [
         ("meta", {"property": "article:published_time"}, "content"),
         ("meta", {"property": "og:article:published_time"}, "content"),
@@ -241,6 +392,8 @@ def extract_published_date(soup):
         ("meta", {"name": "date"}, "content"),
         ("meta", {"itemprop": "datePublished"}, "content"),
         ("meta", {"property": "article:modified_time"}, "content"),
+        ("meta", {"name": "DC.date"}, "content"),
+        ("meta", {"name": "DC.Date"}, "content"),
     ]
 
     for tag, attrs, attr in meta_specs:
@@ -259,10 +412,9 @@ def extract_published_date(soup):
         if d:
             return d
 
-    for css in [".date", ".post-date", ".published", ".entry-date", ".news-date", "time"]:
-        el = soup.select_one(css)
-        if el:
-            d = parse_date_string(el.get("datetime") or el.get_text(" ", strip=True))
+    for css in DATE_CSS:
+        for el in soup.select(css):
+            d = parse_date_string(el.get("datetime") or el.get("content") or el.get_text(" ", strip=True))
             if d:
                 return d
 
@@ -274,6 +426,16 @@ def extract_published_date(soup):
                 return d
         except (json.JSONDecodeError, TypeError):
             continue
+
+    for fn in (extract_dates_from_visible_header, find_first_page_date):
+        d = fn(soup)
+        if d:
+            return d
+
+    if page_url:
+        d = extract_date_from_url(page_url)
+        if d:
+            return d
 
     return None
 
@@ -438,6 +600,12 @@ def looks_like_news_link(title, href, city):
     if any(bad in href_l for bad in BAD_URL_WORDS):
         return False
 
+    if re.search(r"/(?:kategoria|category|tag|archivum|archive)/[^/]+/?$", href_l):
+        return False
+
+    if re.search(r"/(?:page|oldal)/\d+/?$", href_l):
+        return False
+
     return True
 
 
@@ -456,15 +624,29 @@ def find_candidate_links(city):
         if host and base_host not in host:
             continue
 
+        if any(part in host for part in SKIP_HOST_PARTS):
+            continue
+
         if not looks_like_news_link(title, href, city):
             continue
 
         clean_href = href.split("#")[0].strip()
 
         if clean_href not in [x["url"] for x in links]:
-            links.append({"title": title, "url": clean_href})
+            links.append({
+                "title": title,
+                "url": clean_href,
+                "list_date": extract_date_from_link_context(a) or extract_date_from_url(clean_href),
+            })
 
-    return links[:60]
+    links.sort(
+        key=lambda x: (
+            0 if x.get("list_date") else 1,
+            0 if any(g in x["url"].lower() for g in GOOD_URL_WORDS) else 1,
+        )
+    )
+
+    return links[:40]
 
 
 def collect_city(city):
@@ -486,9 +668,13 @@ def collect_city(city):
         if not is_probably_news(title, cand["url"], body_raw):
             continue
 
-        published = extract_published_date(soup)
+        published = extract_published_date(soup, cand["url"], cand.get("list_date"))
         if not published:
             print(f"  SKIP no published date: {cand['url']}")
+            continue
+
+        if not is_recent_enough(published):
+            print(f"  SKIP too old ({published}): {cand['url']}")
             continue
 
         image = extract_image(soup, cand["url"])
